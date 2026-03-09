@@ -11,6 +11,7 @@ import (
 
 	"github.com/marcus/td/internal/db"
 	"github.com/marcus/td/internal/session"
+	"github.com/marcus/td/internal/syncbackend"
 	"github.com/marcus/td/internal/syncclient"
 )
 
@@ -159,13 +160,14 @@ func TestAutoSyncPush_BatchesLargePayload(t *testing.T) {
 	defer srv.Close()
 
 	client := syncclient.New(srv.URL, "test-key", "dev-test")
+	backend := syncbackend.NewHTTPBackend(client, "test-project")
 
 	state, err := database.GetSyncState()
 	if err != nil || state == nil {
 		t.Fatalf("get sync state: %v", err)
 	}
 
-	err = autoSyncPush(database, client, state, "dev-test")
+	err = autoSyncPush(database, backend, state, "dev-test")
 	if err != nil {
 		t.Fatalf("autoSyncPush: %v", err)
 	}
@@ -204,13 +206,14 @@ func TestAutoSyncPush_SmallPayloadSingleBatch(t *testing.T) {
 	defer srv.Close()
 
 	client := syncclient.New(srv.URL, "test-key", "dev-test")
+	backend := syncbackend.NewHTTPBackend(client, "test-project")
 
 	state, err := database.GetSyncState()
 	if err != nil || state == nil {
 		t.Fatalf("get sync state: %v", err)
 	}
 
-	err = autoSyncPush(database, client, state, "dev-test")
+	err = autoSyncPush(database, backend, state, "dev-test")
 	if err != nil {
 		t.Fatalf("autoSyncPush: %v", err)
 	}
@@ -235,13 +238,14 @@ func TestAutoSyncPush_ExactBatchBoundary(t *testing.T) {
 	defer srv.Close()
 
 	client := syncclient.New(srv.URL, "test-key", "dev-test")
+	backend := syncbackend.NewHTTPBackend(client, "test-project")
 
 	state, err := database.GetSyncState()
 	if err != nil || state == nil {
 		t.Fatalf("get sync state: %v", err)
 	}
 
-	err = autoSyncPush(database, client, state, "dev-test")
+	err = autoSyncPush(database, backend, state, "dev-test")
 	if err != nil {
 		t.Fatalf("autoSyncPush: %v", err)
 	}
@@ -265,13 +269,14 @@ func TestAutoSyncPush_NothingToPush(t *testing.T) {
 	defer srv.Close()
 
 	client := syncclient.New(srv.URL, "test-key", "dev-test")
+	backend := syncbackend.NewHTTPBackend(client, "test-project")
 
 	state, err := database.GetSyncState()
 	if err != nil || state == nil {
 		t.Fatalf("get sync state: %v", err)
 	}
 
-	err = autoSyncPush(database, client, state, "dev-test")
+	err = autoSyncPush(database, backend, state, "dev-test")
 	if err != nil {
 		t.Fatalf("autoSyncPush: %v", err)
 	}
@@ -295,6 +300,7 @@ func TestAutoSyncPush_ServerRejectsUnbatched(t *testing.T) {
 	defer srv.Close()
 
 	client := syncclient.New(srv.URL, "test-key", "dev-test")
+	backend := syncbackend.NewHTTPBackend(client, "test-project")
 
 	state, err := database.GetSyncState()
 	if err != nil || state == nil {
@@ -302,7 +308,7 @@ func TestAutoSyncPush_ServerRejectsUnbatched(t *testing.T) {
 	}
 
 	// autoSyncPush should succeed because it batches internally
-	err = autoSyncPush(database, client, state, "dev-test")
+	err = autoSyncPush(database, backend, state, "dev-test")
 	if err != nil {
 		t.Fatalf("autoSyncPush should succeed with batching, got: %v", err)
 	}

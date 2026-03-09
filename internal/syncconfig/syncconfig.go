@@ -21,12 +21,19 @@ type AutoSyncConfig struct {
 	Pull     *bool  `json:"pull,omitempty"`     // nil = default true
 }
 
+// GitHubSyncConfig holds GitHub-specific sync settings.
+type GitHubSyncConfig struct {
+	Repo string `json:"repo,omitempty"` // owner/repo for GitHub Issues backend
+}
+
 // SyncConfig holds sync-related settings.
 type SyncConfig struct {
-	URL               string         `json:"url"`
-	Enabled           bool           `json:"enabled"`
-	SnapshotThreshold *int           `json:"snapshot_threshold,omitempty"`
-	Auto              AutoSyncConfig `json:"auto"`
+	URL               string           `json:"url"`
+	Enabled           bool             `json:"enabled"`
+	SnapshotThreshold *int             `json:"snapshot_threshold,omitempty"`
+	Auto              AutoSyncConfig   `json:"auto"`
+	Backend           string           `json:"backend,omitempty"` // "http" (default) or "github"
+	GitHub            GitHubSyncConfig `json:"github,omitempty"`
 }
 
 // Config is the global td config stored at ~/.config/td/config.json.
@@ -149,6 +156,32 @@ func GetServerURL() string {
 		return cfg.Sync.URL
 	}
 	return defaultServerURL
+}
+
+// GetSyncBackend returns the configured sync backend type.
+// Priority: TD_SYNC_BACKEND env > config.json > default ("http").
+func GetSyncBackend() string {
+	if v := os.Getenv("TD_SYNC_BACKEND"); v != "" {
+		return strings.ToLower(v)
+	}
+	cfg, err := LoadConfig()
+	if err == nil && cfg.Sync.Backend != "" {
+		return strings.ToLower(cfg.Sync.Backend)
+	}
+	return "http"
+}
+
+// GetGitHubRepo returns the configured GitHub repo for the GitHub sync backend.
+// Priority: TD_SYNC_GITHUB_REPO env > config.json.
+func GetGitHubRepo() string {
+	if v := os.Getenv("TD_SYNC_GITHUB_REPO"); v != "" {
+		return v
+	}
+	cfg, err := LoadConfig()
+	if err == nil {
+		return cfg.Sync.GitHub.Repo
+	}
+	return ""
 }
 
 // GetSnapshotThreshold returns the snapshot bootstrap threshold (min server events).

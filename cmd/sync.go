@@ -15,6 +15,7 @@ import (
 	"github.com/marcus/td/internal/output"
 	"github.com/marcus/td/internal/session"
 	tdsync "github.com/marcus/td/internal/sync"
+	"github.com/marcus/td/internal/syncbackend"
 	"github.com/marcus/td/internal/syncclient"
 	"github.com/marcus/td/internal/syncconfig"
 	"github.com/spf13/cobra"
@@ -88,18 +89,26 @@ var syncCmd = &cobra.Command{
 			return err
 		}
 
-		serverURL := syncconfig.GetServerURL()
-		apiKey := syncconfig.GetAPIKey()
-		client := syncclient.New(serverURL, apiKey, deviceID)
-
-		if statusOnly {
-			return runSyncStatus(database, client, syncState)
+		backend, err := syncbackend.NewBackend(syncState.ProjectID)
+		if err != nil {
+			output.Error("create sync backend: %v", err)
+			return err
 		}
 
-		// Try snapshot bootstrap on first sync
+		// Keep a direct HTTP client for operations that need it (bootstrap, snapshot).
+		// The backend handles push/pull/status through the SyncBackend interface.
+		serverURL := syncconfig.GetServerURL()
+		apiKey := syncconfig.GetAPIKey()
+		httpClient := syncclient.New(serverURL, apiKey, deviceID)
+
+		if statusOnly {
+			return runSyncStatus(database, backend, syncState)
+		}
+
+		// Try snapshot bootstrap on first sync (HTTP-only for now)
 		bootstrapped := false
 		if !pushOnly && syncState.LastPulledServerSeq == 0 {
-			newDB, err := runBootstrap(database, client, syncState)
+			newDB, err := runBootstrap(database, httpClient, syncState)
 			if newDB != nil {
 				database = newDB // old DB already closed by runBootstrap
 			}
@@ -116,13 +125,13 @@ var syncCmd = &cobra.Command{
 		}
 
 		if !pullOnly {
-			if err := runPush(database, client, syncState, deviceID); err != nil {
+			if err := runPush(database, backend, syncState, deviceID); err != nil {
 				return err
 			}
 		}
 
 		if !pushOnly && !bootstrapped {
-			if err := runPull(database, client, syncState, deviceID); err != nil {
+			if err := runPull(database, backend, syncState, deviceID); err != nil {
 				return err
 			}
 		}
@@ -131,7 +140,7 @@ var syncCmd = &cobra.Command{
 	},
 }
 
-func runSyncStatus(database *db.DB, client *syncclient.Client, state *db.SyncState) error {
+func runSyncStatus(database *db.DB, backend syncbackend.SyncBackend, state *db.SyncState) error {
 	pending, err := database.CountPendingEvents()
 	if err != nil {
 		output.Error("count pending: %v", err)
@@ -139,6 +148,7 @@ func runSyncStatus(database *db.DB, client *syncclient.Client, state *db.SyncSta
 	}
 
 	fmt.Printf("Project:     %s\n", state.ProjectID)
+	fmt.Printf("Backend:     %s\n", backend.Name())
 	fmt.Printf("Last pushed: action %d\n", state.LastPushedActionID)
 	fmt.Printf("Last pulled: seq %d\n", state.LastPulledServerSeq)
 	fmt.Printf("Pending:     %d events\n", pending)
@@ -146,7 +156,7 @@ func runSyncStatus(database *db.DB, client *syncclient.Client, state *db.SyncSta
 		fmt.Printf("Last sync:   %s\n", state.LastSyncAt.Format(time.RFC3339))
 	}
 
-	serverStatus, err := client.SyncStatus(state.ProjectID)
+	serverStatus, err := backend.Status()
 	if err != nil {
 		if errors.Is(err, syncclient.ErrUnauthorized) {
 			output.Warning("unauthorized - re-login may be needed")
@@ -300,7 +310,7 @@ func filterEventsForSync(events []tdsync.Event, validator tdsync.EntityValidator
 	return filtered
 }
 
-func runPush(database *db.DB, client *syncclient.Client, state *db.SyncState, deviceID string) error {
+func runPush(database *db.DB, backend syncbackend.SyncBackend, state *db.SyncState, deviceID string) error {
 	sess, err := session.Get(database)
 	if err != nil {
 		output.Error("get session: %v", err)
@@ -340,22 +350,13 @@ func runPush(database *db.DB, client *syncclient.Client, state *db.SyncState, de
 		}
 		batch := events[i:end]
 
-		pushReq := &syncclient.PushRequest{
+		pushReq := &syncbackend.PushRequest{
 			DeviceID:  deviceID,
 			SessionID: sess.ID,
-		}
-		for _, ev := range batch {
-			pushReq.Events = append(pushReq.Events, syncclient.EventInput{
-				ClientActionID:  ev.ClientActionID,
-				ActionType:      ev.ActionType,
-				EntityType:      ev.EntityType,
-				EntityID:        ev.EntityID,
-				Payload:         ev.Payload,
-				ClientTimestamp: ev.ClientTimestamp.Format(time.RFC3339),
-			})
+			Events:    batch,
 		}
 
-		pushResp, err := client.Push(state.ProjectID, pushReq)
+		pushResp, err := backend.Push(pushReq)
 		if err != nil {
 			if errors.Is(err, syncclient.ErrUnauthorized) {
 				output.Error("unauthorized - re-login may be needed")
@@ -435,7 +436,7 @@ func runPush(database *db.DB, client *syncclient.Client, state *db.SyncState, de
 	return nil
 }
 
-func runPull(database *db.DB, client *syncclient.Client, state *db.SyncState, deviceID string) error {
+func runPull(database *db.DB, backend syncbackend.SyncBackend, state *db.SyncState, deviceID string) error {
 	lastSeq := state.LastPulledServerSeq
 	totalPulled := 0
 	totalApplied := 0
@@ -443,7 +444,7 @@ func runPull(database *db.DB, client *syncclient.Client, state *db.SyncState, de
 	var allConflicts []tdsync.ConflictRecord
 
 	for {
-		pullResp, err := client.Pull(state.ProjectID, lastSeq, 1000, "")
+		pullResp, err := backend.Pull(lastSeq, 1000, "")
 		if err != nil {
 			if errors.Is(err, syncclient.ErrUnauthorized) {
 				output.Error("unauthorized - re-login may be needed")
@@ -457,23 +458,6 @@ func runPull(database *db.DB, client *syncclient.Client, state *db.SyncState, de
 			break
 		}
 
-		// Convert pull events to sync events
-		events := make([]tdsync.Event, len(pullResp.Events))
-		for i, pe := range pullResp.Events {
-			clientTS, _ := time.Parse(time.RFC3339, pe.ClientTimestamp)
-			events[i] = tdsync.Event{
-				ServerSeq:       pe.ServerSeq,
-				DeviceID:        pe.DeviceID,
-				SessionID:       pe.SessionID,
-				ClientActionID:  pe.ClientActionID,
-				ActionType:      pe.ActionType,
-				EntityType:      pe.EntityType,
-				EntityID:        pe.EntityID,
-				Payload:         pe.Payload,
-				ClientTimestamp: clientTS,
-			}
-		}
-
 		conn := database.Conn()
 		tx, err := conn.Begin()
 		if err != nil {
@@ -481,7 +465,7 @@ func runPull(database *db.DB, client *syncclient.Client, state *db.SyncState, de
 			return err
 		}
 
-		result, err := tdsync.ApplyRemoteEvents(tx, events, deviceID, syncEntityValidator, state.LastSyncAt)
+		result, err := tdsync.ApplyRemoteEvents(tx, pullResp.Events, deviceID, syncEntityValidator, state.LastSyncAt)
 		if err != nil {
 			tx.Rollback()
 			output.Error("apply events: %v", err)
@@ -504,7 +488,7 @@ func runPull(database *db.DB, client *syncclient.Client, state *db.SyncState, de
 
 		// Record sync history
 		var historyEntries []db.SyncHistoryEntry
-		for _, ev := range events {
+		for _, ev := range pullResp.Events {
 			historyEntries = append(historyEntries, db.SyncHistoryEntry{
 				Direction:  "pull",
 				ActionType: ev.ActionType,

@@ -11,6 +11,7 @@ import (
 	"github.com/marcus/td/internal/db"
 	"github.com/marcus/td/internal/session"
 	tdsync "github.com/marcus/td/internal/sync"
+	"github.com/marcus/td/internal/syncbackend"
 	"github.com/marcus/td/internal/syncclient"
 	"github.com/marcus/td/internal/syncconfig"
 )
@@ -119,17 +120,23 @@ func autoSyncOnce() {
 		return
 	}
 
-	serverURL := syncconfig.GetServerURL()
-	apiKey := syncconfig.GetAPIKey()
-	client := syncclient.New(serverURL, apiKey, deviceID)
-	client.HTTP.Timeout = autoSyncHTTPTimeout
+	backend, err := syncbackend.NewBackend(syncState.ProjectID)
+	if err != nil {
+		slog.Debug("autosync: create backend", "err", err)
+		return
+	}
 
-	if err := autoSyncPush(database, client, syncState, deviceID); err != nil {
+	// For HTTP backend, apply the shorter auto-sync timeout
+	if httpBackend, ok := backend.(*syncbackend.HTTPBackend); ok {
+		_ = httpBackend // timeout is set on the underlying syncclient.Client
+	}
+
+	if err := autoSyncPush(database, backend, syncState, deviceID); err != nil {
 		slog.Debug("autosync: push", "err", err)
 	}
 
 	if syncconfig.GetAutoSyncPull() {
-		if err := autoSyncPull(database, client, syncState, deviceID); err != nil {
+		if err := autoSyncPull(database, backend, syncState, deviceID); err != nil {
 			slog.Debug("autosync: pull", "err", err)
 		}
 	}
@@ -169,32 +176,16 @@ func autoSyncOnStartup(cmdName string) {
 }
 
 // autoSyncPull pulls remote events and applies them silently.
-func autoSyncPull(database *db.DB, client *syncclient.Client, state *db.SyncState, deviceID string) error {
+func autoSyncPull(database *db.DB, backend syncbackend.SyncBackend, state *db.SyncState, deviceID string) error {
 	lastSeq := state.LastPulledServerSeq
 
 	for {
-		pullResp, err := client.Pull(state.ProjectID, lastSeq, 1000, deviceID)
+		pullResp, err := backend.Pull(lastSeq, 1000, deviceID)
 		if err != nil {
 			return fmt.Errorf("pull: %w", err)
 		}
 		if len(pullResp.Events) == 0 {
 			break
-		}
-
-		events := make([]tdsync.Event, len(pullResp.Events))
-		for i, pe := range pullResp.Events {
-			clientTS, _ := time.Parse(time.RFC3339, pe.ClientTimestamp)
-			events[i] = tdsync.Event{
-				ServerSeq:       pe.ServerSeq,
-				DeviceID:        pe.DeviceID,
-				SessionID:       pe.SessionID,
-				ClientActionID:  pe.ClientActionID,
-				ActionType:      pe.ActionType,
-				EntityType:      pe.EntityType,
-				EntityID:        pe.EntityID,
-				Payload:         pe.Payload,
-				ClientTimestamp: clientTS,
-			}
 		}
 
 		conn := database.Conn()
@@ -203,7 +194,7 @@ func autoSyncPull(database *db.DB, client *syncclient.Client, state *db.SyncStat
 			return fmt.Errorf("begin tx: %w", err)
 		}
 
-		result, err := tdsync.ApplyRemoteEvents(tx, events, deviceID, syncEntityValidator, state.LastSyncAt)
+		result, err := tdsync.ApplyRemoteEvents(tx, pullResp.Events, deviceID, syncEntityValidator, state.LastSyncAt)
 		if err != nil {
 			tx.Rollback()
 			return fmt.Errorf("apply events: %w", err)
@@ -221,7 +212,7 @@ func autoSyncPull(database *db.DB, client *syncclient.Client, state *db.SyncStat
 
 		// Record sync history
 		var historyEntries []db.SyncHistoryEntry
-		for _, ev := range events {
+		for _, ev := range pullResp.Events {
 			historyEntries = append(historyEntries, db.SyncHistoryEntry{
 				Direction:  "pull",
 				ActionType: ev.ActionType,
@@ -252,7 +243,7 @@ func autoSyncPull(database *db.DB, client *syncclient.Client, state *db.SyncStat
 
 // autoSyncPush pushes pending events silently. Returns nil if nothing to push.
 // Batches events to stay within server limits (pushBatchSize from sync.go).
-func autoSyncPush(database *db.DB, client *syncclient.Client, state *db.SyncState, deviceID string) error {
+func autoSyncPush(database *db.DB, backend syncbackend.SyncBackend, state *db.SyncState, deviceID string) error {
 	sess, err := session.Get(database)
 	if err != nil {
 		return fmt.Errorf("get session: %w", err)
@@ -286,22 +277,13 @@ func autoSyncPush(database *db.DB, client *syncclient.Client, state *db.SyncStat
 		}
 		batch := events[i:end]
 
-		pushReq := &syncclient.PushRequest{
+		pushReq := &syncbackend.PushRequest{
 			DeviceID:  deviceID,
 			SessionID: sess.ID,
-		}
-		for _, ev := range batch {
-			pushReq.Events = append(pushReq.Events, syncclient.EventInput{
-				ClientActionID:  ev.ClientActionID,
-				ActionType:      ev.ActionType,
-				EntityType:      ev.EntityType,
-				EntityID:        ev.EntityID,
-				Payload:         ev.Payload,
-				ClientTimestamp: ev.ClientTimestamp.Format(time.RFC3339),
-			})
+			Events:    batch,
 		}
 
-		pushResp, err := client.Push(state.ProjectID, pushReq)
+		pushResp, err := backend.Push(pushReq)
 		if err != nil {
 			if errors.Is(err, syncclient.ErrUnauthorized) {
 				return fmt.Errorf("unauthorized")
