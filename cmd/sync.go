@@ -60,9 +60,14 @@ var syncCmd = &cobra.Command{
 		pullOnly, _ := cmd.Flags().GetBool("pull")
 		statusOnly, _ := cmd.Flags().GetBool("status")
 
-		if !syncconfig.IsAuthenticated() {
-			output.Error("not logged in (run: td auth login)")
-			return fmt.Errorf("not authenticated")
+		backendType := syncconfig.GetSyncBackend()
+
+		// Auth check: HTTP backend needs td-sync auth; GitHub uses its own token
+		if backendType == "http" || backendType == "" {
+			if !syncconfig.IsAuthenticated() {
+				output.Error("not logged in (run: td auth login)")
+				return fmt.Errorf("not authenticated")
+			}
 		}
 
 		baseDir := getBaseDir()
@@ -78,6 +83,26 @@ var syncCmd = &cobra.Command{
 			output.Error("get sync state: %v", err)
 			return err
 		}
+
+		// Auto-create sync_state for GitHub backend using the configured repo
+		if syncState == nil && backendType == "github" {
+			repo := syncconfig.GetGitHubRepo()
+			if repo == "" {
+				output.Error("github backend requires sync.github.repo config\n  Run: td config set sync.github.repo owner/repo")
+				return fmt.Errorf("github repo not configured")
+			}
+			if err := database.SetSyncState(repo); err != nil {
+				output.Error("initialize sync state: %v", err)
+				return err
+			}
+			syncState, err = database.GetSyncState()
+			if err != nil || syncState == nil {
+				output.Error("failed to initialize sync state")
+				return fmt.Errorf("sync state init failed")
+			}
+			output.Info("Linked to GitHub repo: %s", repo)
+		}
+
 		if syncState == nil {
 			output.Error("project not linked (run: td sync-project link <id>)")
 			return fmt.Errorf("not linked")
@@ -95,19 +120,17 @@ var syncCmd = &cobra.Command{
 			return err
 		}
 
-		// Keep a direct HTTP client for operations that need it (bootstrap, snapshot).
-		// The backend handles push/pull/status through the SyncBackend interface.
-		serverURL := syncconfig.GetServerURL()
-		apiKey := syncconfig.GetAPIKey()
-		httpClient := syncclient.New(serverURL, apiKey, deviceID)
-
 		if statusOnly {
 			return runSyncStatus(database, backend, syncState)
 		}
 
-		// Try snapshot bootstrap on first sync (HTTP-only for now)
+		// Bootstrap is HTTP-only (snapshots don't apply to GitHub backend)
 		bootstrapped := false
-		if !pushOnly && syncState.LastPulledServerSeq == 0 {
+		if (backendType == "http" || backendType == "") && !pushOnly && syncState.LastPulledServerSeq == 0 {
+			// Keep a direct HTTP client for bootstrap/snapshot operations
+			serverURL := syncconfig.GetServerURL()
+			apiKey := syncconfig.GetAPIKey()
+			httpClient := syncclient.New(serverURL, apiKey, deviceID)
 			newDB, err := runBootstrap(database, httpClient, syncState)
 			if newDB != nil {
 				database = newDB // old DB already closed by runBootstrap

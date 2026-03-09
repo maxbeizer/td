@@ -416,6 +416,7 @@ func upsertEntityWithMode(tx *sql.Tx, entityType, entityID string, newData json.
 		return applyResult{}, fmt.Errorf("upsert %s/%s: %w", entityType, entityID, err)
 	}
 	return applyResult{Overwritten: overwritten, OldData: oldData}, nil
+	return applyResult{Overwritten: overwritten, OldData: oldData}, nil
 }
 
 // deleteEntity hard-deletes a row. No-op if the row does not exist.
